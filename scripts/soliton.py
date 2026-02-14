@@ -219,7 +219,9 @@ async def fetch_batch(
             ssl=False,
         ) as resp:
             resp.raise_for_status()
-            data = await resp.json(content_type=None)
+            raw = await resp.read()
+            import json as _json
+            data = _json.loads(raw.decode("utf-8", errors="replace"))
             print(f"  offset={offset:3d}  loaded={data.get('loadedCount')}  "
                   f"hasMore={data.get('hasMore')}")
             return offset, data
