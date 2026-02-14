@@ -1,0 +1,311 @@
+"""
+texnohome.az tablet scraper
+Uses asyncio + aiohttp (with curl_cffi for Cloudflare bypass)
+
+Listing: GET https://texnohome.az/smartfon-ve-plansetler/plansetler?page=N
+  Pagination: ?page=N links in ul.pagination
+  Last page  : max page number extracted from ul.pagination a[href*="?page="]
+
+Product cards (.product-thumb) contain:
+  - Product ID : onclick="compare.add('ID', this);" on .btn-compare button
+  - Name       : h4.title a
+  - URL        : div.image a[href]
+  - Image      : div.image img[src]
+  - Sale price : .price span.price-new  (current / discounted)
+  - Old price  : .price span.price-old  (original / crossed-out)
+  - Discount   : .product-label .square (e.g. "-16%")
+  - In stock   : .pw-label.stock contains "Stokda yoxdur" → out of stock
+  - Labels     : .pw-label (offer, cheaper, etc.)
+"""
+
+import asyncio
+import csv
+import re
+from pathlib import Path
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+# ── paths ────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+OUTPUT_CSV = DATA_DIR / "texnohome.csv"
+
+# ── constants ────────────────────────────────────────────────────────────────
+BASE_URL     = "https://texnohome.az"
+CATEGORY_URL = f"{BASE_URL}/smartfon-ve-plansetler/plansetler"
+CONCURRENCY  = 3
+DELAY        = 1.0
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/144.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Referer": BASE_URL + "/",
+    "sec-ch-ua": '"Not(A:Brand";v="8","Chromium";v="144","Google Chrome";v="144"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "DNT": "1",
+}
+
+CSV_FIELDS = [
+    "name",
+    "product_id",
+    "price_current",
+    "price_old",
+    "discount_pct",
+    "in_stock",
+    "labels",
+    "url",
+    "image_url",
+    "page",
+]
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def clean_price(text: str) -> str:
+    """'399.90₼' → '399.90'"""
+    return re.sub(r"[^\d.]", "", text.replace(",", ".")).strip()
+
+
+def parse_last_page(soup: BeautifulSoup) -> int:
+    """Return highest ?page=N value found in pagination links."""
+    nums = []
+    for a in soup.select("ul.pagination a[href]"):
+        href = a.get("href", "")
+        m = re.search(r"[?&]page=(\d+)", href)
+        if m:
+            nums.append(int(m.group(1)))
+    return max(nums) if nums else 1
+
+
+def parse_products(html: str, page: int) -> list[dict]:
+    """Extract all product dicts from one listing page."""
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+
+    for card in soup.select(".product-thumb"):
+        # ── product ID ────────────────────────────────────────────────
+        product_id = ""
+        cmp_btn = card.select_one("button[onclick*='compare.add']")
+        if cmp_btn:
+            m = re.search(r"compare\.add\('(\d+)'", cmp_btn.get("onclick", ""))
+            if m:
+                product_id = m.group(1)
+
+        # ── URL ───────────────────────────────────────────────────────
+        url = ""
+        url_a = card.select_one("div.image a[href]")
+        if url_a:
+            href = url_a.get("href", "")
+            url = href if href.startswith("http") else BASE_URL + href
+
+        # ── image ─────────────────────────────────────────────────────
+        image_url = ""
+        img = card.select_one("div.image img")
+        if img:
+            src = img.get("src", "").strip()
+            image_url = src if src.startswith("http") else BASE_URL + src
+
+        # ── name ──────────────────────────────────────────────────────
+        name = ""
+        name_el = card.select_one("h4.title a")
+        if name_el:
+            name = name_el.get_text(strip=True)
+
+        # ── prices ────────────────────────────────────────────────────
+        price_current = ""
+        price_old     = ""
+        cur_el = card.select_one(".price span.price-new")
+        old_el = card.select_one(".price span.price-old")
+        if cur_el:
+            price_current = clean_price(cur_el.get_text())
+        if old_el:
+            price_old = clean_price(old_el.get_text())
+
+        # ── discount ──────────────────────────────────────────────────
+        discount_pct = ""
+        disc_el = card.select_one(".product-label .square")
+        if disc_el:
+            discount_pct = disc_el.get_text(strip=True)   # e.g. "-16%"
+
+        # ── stock status ──────────────────────────────────────────────
+        stock_el = card.select_one(".pw-label.stock")
+        if stock_el and "yoxdur" in stock_el.get_text().lower():
+            in_stock = "False"
+        else:
+            in_stock = "True"
+
+        # ── offer/campaign labels ─────────────────────────────────────
+        label_texts = [
+            el.get_text(strip=True)
+            for el in card.select(".pw-label")
+            if el.get_text(strip=True) and "yoxdur" not in el.get_text().lower()
+        ]
+        labels = "; ".join(label_texts)
+
+        products.append({
+            "name":          name,
+            "product_id":    product_id,
+            "price_current": price_current,
+            "price_old":     price_old,
+            "discount_pct":  discount_pct,
+            "in_stock":      in_stock,
+            "labels":        labels,
+            "url":           url,
+            "image_url":     image_url,
+            "page":          page,
+        })
+
+    return products
+
+
+# ── async fetch ──────────────────────────────────────────────────────────────
+
+async def fetch_page(
+    session: aiohttp.ClientSession,
+    page: int,
+    sem: asyncio.Semaphore,
+) -> tuple[int, str]:
+    """GET one listing page; return (page, html)."""
+    url = f"{CATEGORY_URL}?page={page}" if page > 1 else CATEGORY_URL
+    async with sem:
+        await asyncio.sleep(DELAY)
+        async with session.get(url, headers=HEADERS, ssl=False) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+            print(f"  page={page}  status={resp.status}")
+            return page, html
+
+
+async def scrape_all() -> list[dict]:
+    """Fetch page 1 to discover last page, then all pages concurrently."""
+    sem       = asyncio.Semaphore(CONCURRENCY)
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout   = aiohttp.ClientTimeout(total=15, connect=8)
+    all_products: list[dict] = []
+
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=timeout
+        ) as session:
+            print("Fetching page 1 …")
+            _, html1  = await fetch_page(session, 1, asyncio.Semaphore(1))
+            soup1     = BeautifulSoup(html1, "html.parser")
+            last_page = parse_last_page(soup1)
+            print(f"  last_page={last_page}")
+            all_products.extend(parse_products(html1, 1))
+
+            if last_page > 1:
+                tasks   = [fetch_page(session, p, sem) for p in range(2, last_page + 1)]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in sorted(
+                    [r for r in results if not isinstance(r, Exception)],
+                    key=lambda x: x[0],
+                ):
+                    pg, html = result
+                    all_products.extend(parse_products(html, pg))
+                for result in results:
+                    if isinstance(result, Exception):
+                        print(f"  [warn] {result}")
+
+    except (aiohttp.ClientResponseError, aiohttp.ServerTimeoutError, asyncio.TimeoutError) as e:
+        status = getattr(e, "status", None)
+        if status == 403 or status is None:
+            reason = f"[{status}]" if status else "[timeout/connection error]"
+            print(f"\n  {reason} Cloudflare — falling back to curl_cffi …\n")
+            return await scrape_all_cffi()
+        raise
+
+    return all_products
+
+
+# ── curl_cffi fallback ────────────────────────────────────────────────────────
+
+async def scrape_all_cffi() -> list[dict]:
+    """Fallback: curl_cffi with Chrome TLS impersonation."""
+    from curl_cffi.requests import AsyncSession
+
+    sem = asyncio.Semaphore(CONCURRENCY)
+    all_products: list[dict] = []
+
+    async def fetch_cffi(s, page: int) -> tuple[int, str]:
+        async with sem:
+            await asyncio.sleep(DELAY)
+            url  = f"{CATEGORY_URL}?page={page}" if page > 1 else CATEGORY_URL
+            resp = await s.get(url, headers=HEADERS)
+            resp.raise_for_status()
+            print(f"  [cffi] page={page}  status={resp.status_code}")
+            return page, resp.text
+
+    async with AsyncSession(impersonate="chrome124") as s:
+        _, html1   = await fetch_cffi(s, 1)
+        soup1      = BeautifulSoup(html1, "html.parser")
+        last_page  = parse_last_page(soup1)
+        print(f"  last_page={last_page}")
+        all_products.extend(parse_products(html1, 1))
+
+        if last_page > 1:
+            tasks   = [fetch_cffi(s, p) for p in range(2, last_page + 1)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in sorted(
+                [r for r in results if not isinstance(r, Exception)],
+                key=lambda x: x[0],
+            ):
+                pg, html = result
+                all_products.extend(parse_products(html, pg))
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"  [warn] {result}")
+
+    return all_products
+
+
+# ── CSV writer ────────────────────────────────────────────────────────────────
+
+def save_csv(products: list[dict], path: Path) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(products)
+    print(f"\nSaved {len(products)} products → {path}")
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    print(f"Scraping: {CATEGORY_URL}")
+    products = await scrape_all()
+
+    if not products:
+        print("No products found — check selectors or connectivity.")
+        return
+
+    # Deduplicate by product_id (falling back to url)
+    seen: set[str] = set()
+    unique = []
+    for p in products:
+        key = p["product_id"] or p["url"]
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(p)
+        elif not key:
+            unique.append(p)
+
+    print(f"\nTotal unique products: {len(unique)}")
+    save_csv(unique, OUTPUT_CSV)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
